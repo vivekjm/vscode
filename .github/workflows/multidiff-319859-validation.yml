@@ -1,0 +1,159 @@
+name: Validate and stage multi-diff 319859
+
+on:
+  push:
+    branches:
+      - maintenance/multidiff-319859-validation-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Port the reviewed two-file change onto current upstream
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.request import urlopen
+          old_head = '05778bf42ffc5d799cf35f9b985f945d7fb21a51'
+          src = 'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts'
+          test = 'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts'
+          def old(path):
+              with urlopen('https://raw.githubusercontent.com/vivekjm/vscode/' + old_head + '/' + path, timeout=30) as response:
+                  return response.read().decode()
+          def replace_once(source, before, after):
+              assert source.count(before) == 1, before
+              return source.replace(before, after)
+          previous = old(src)
+          source = Path(src).read_text()
+          source = replace_once(source, 'import { ITextResourceConfigurationService }', 'import { ITextResourceConfigurationChangeEvent, ITextResourceConfigurationService }')
+          marker = '\t\tthis._isDirtyObservables = mapObservableArrayCached('
+          init = "\t\tthis.textResourceConfigurationServiceOnDidChange = new ResourceConfigurationEventDispatcher(\n\t\t\tthis._textResourceConfigurationService.onDidChangeConfiguration,\n\t\t\turi => uri.toString()\n\t\t);\n"
+          source = replace_once(source, marker, init + marker)
+          previous_handler = "\t\t\t\tonOptionsDidChange: h => this._textResourceConfigurationService.onDidChangeConfiguration(e => {\n\t\t\t\t\tif (e.affectsConfiguration(uri, 'editor') || e.affectsConfiguration(uri, 'diffEditor')) {\n\t\t\t\t\t\th();\n\t\t\t\t\t}\n\t\t\t\t}),"
+          source = replace_once(source, previous_handler, '\t\t\t\tonOptionsDidChange: this.textResourceConfigurationServiceOnDidChange.filteredEvent(uri),')
+          marker = '\tprivate readonly textFileServiceOnDidChange;'
+          source = replace_once(source, marker, marker + '\n\tprivate readonly textResourceConfigurationServiceOnDidChange;')
+          start = previous.index('/**\n * Dispatches resource-specific configuration changes')
+          end = previous.index('\nfunction isUriDirty(', start)
+          dispatcher = previous[start:end]
+          source = replace_once(source, 'function isUriDirty(', dispatcher + '\nfunction isUriDirty(')
+          Path(src).write_text(source)
+
+          previous = old(test)
+          source = Path(test).read_text()
+          replacements = [
+              ("import assert from 'assert';", "import assert, { strictEqual } from 'assert';"),
+              ('import { CancellationError }', 'import { CancellationError, errorHandler, setUnexpectedErrorHandler }'),
+              ('import { Event, ValueWithChangeEvent }', 'import { Emitter, Event, ValueWithChangeEvent }'),
+              ('import { IReference }', 'import { DisposableStore, IReference }'),
+              ('import { ITextResourceConfigurationService }', 'import { ITextResourceConfigurationChangeEvent, ITextResourceConfigurationService }'),
+              ('import { MultiDiffEditorInput }', 'import { MultiDiffEditorInput, ResourceConfigurationEventDispatcher }'),
+          ]
+          for before, after in replacements:
+              source = replace_once(source, before, after)
+          start = previous.index("\ttest('should multiplex resource configuration listeners'")
+          end = previous.index("\ttest('updates its name from the resolved source label'", start)
+          tests = previous[start:end]
+          marker = "\ttest('updates its name from the resolved source label'"
+          source = replace_once(source, marker, tests + marker)
+          Path(test).write_text(source)
+          PY
+      - name: Native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbfile-dev libkrb5-dev libsecret-1-dev
+      - name: Install workspace dependencies
+        run: npm ci
+      - name: Type-check the client
+        run: npm run typecheck-client
+      - name: Compile browser client
+        run: npm run gulp compile-client
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run all multi-diff browser tests
+        run: npm run test-browser-no-install -- --browser chromium --run src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts
+      - name: Lint changed files
+        run: node build/eslint.ts src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts
+      - name: Collect the validated result
+        run: |
+          git diff --check
+          python3 - <<'PY'
+          import hashlib, json, shutil, subprocess
+          from pathlib import Path
+          paths = [
+            'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts',
+            'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts',
+          ]
+          actual = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(actual) == set(paths), actual
+          manifest = {}
+          for path in paths:
+              data = Path(path).read_bytes()
+              manifest[path] = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              dest = Path('candidate') / path
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, dest)
+          Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2))
+          Path('candidate/multidiff-319859.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', *paths]))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multidiff-319859-validated-candidate
+          path: candidate
+          retention-days: 7
+  stage-candidate:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: multidiff-319859-validated-candidate
+          path: candidate
+      - name: Publish a candidate branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          root = 'https://api.github.com/repos/vivekjm/vscode/'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+          def post(path, payload):
+              with urlopen(Request(root + path, data=json.dumps(payload).encode(), headers=headers, method='POST'), timeout=30) as response:
+                  return json.load(response)
+          allowed = {
+              'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts',
+              'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts',
+          }
+          manifest = json.loads(Path('candidate/manifest.json').read_text())
+          assert set(manifest) == allowed
+          entries = []
+          for path, expected in manifest.items():
+              data = (Path('candidate') / path).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
+              blob = post('git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert blob['sha'] == expected
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': expected})
+          tree = post('git/trees', {'base_tree': 'b36b591e3aa02fb22924e651a7da4559cdf16f8e', 'tree': entries})
+          commit = post('git/commits', {'message': 'fix: refresh multi-diff listener dispatcher against current main', 'tree': tree['sha'], 'parents': ['05778bf42ffc5d799cf35f9b985f945d7fb21a51', 'd9637b3f2faa8f8ce0636e556291fdb1ba714c0b']})
+          post('git/refs', {'ref': 'refs/heads/maintenance/multidiff-319859-validated-20260906', 'sha': commit['sha']})
+          print(json.dumps({'candidate_sha': commit['sha'], 'tree_sha': tree['sha'], 'files': manifest}, indent=2))
+          PY
