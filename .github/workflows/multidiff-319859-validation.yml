@@ -22,6 +22,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+          cache: npm
       - name: Port the reviewed two-file change onto current upstream
         run: |
           python3 - <<'PY'
@@ -79,23 +80,64 @@ jobs:
         run: npm ci
       - name: Type-check the client
         run: npm run typecheck-client
-      - name: Compile browser client
-        run: npm run gulp compile-client
+      - name: Check unchanged upstream generation, then compile candidate
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          paths = [
+              'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts',
+              'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts',
+          ]
+          saved = {path: Path(path).read_bytes() for path in paths}
+          for path in paths:
+              Path(path).write_bytes(subprocess.check_output(['git', 'show', 'HEAD:' + path]))
+          result = subprocess.run(['npm', 'run', 'gulp', 'compile-client'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          Path('upstream-compile.log').write_text(result.stdout)
+          print(result.stdout[-7000:])
+          if result.returncode:
+              assert 'monaco.d.ts is no longer up to date' in result.stdout, 'Unrecognized upstream compilation failure'
+          generated = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          permitted = {
+              'src/vs/monaco.d.ts',
+              'src/vs/editor/common/standalone/standaloneEnums.ts',
+              'src/vs/platform/extensions/common/extensionsApiProposals.ts',
+              'src/vs/workbench/services/extensions/common/extensionPoints.ts',
+          }
+          assert set(generated) <= permitted, generated
+          baseline = {path: Path(path).read_bytes() for path in generated}
+          Path('upstream-generated.patch').write_bytes(subprocess.check_output(['git', 'diff']))
+          Path('upstream-generated-files.json').write_text(json.dumps(generated))
+          for path, data in saved.items():
+              Path(path).write_bytes(data)
+          result = subprocess.run(['npm', 'run', 'gulp', 'compile-client'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          Path('candidate-compile.log').write_text(result.stdout)
+          print(result.stdout[-7000:])
+          assert result.returncode == 0, 'Candidate compilation failed'
+          for path, data in baseline.items():
+              assert Path(path).read_bytes() == data, 'Candidate changed upstream generation: ' + path
+          print('Candidate compiled successfully; generated declaration drift is identical on unchanged upstream.')
+          PY
+      - name: Type-check after upstream declaration generation
+        run: npm run typecheck-client
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
       - name: Run all multi-diff browser tests
         run: npm run test-browser-no-install -- --browser chromium --run src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts
       - name: Lint changed files
         run: node build/eslint.ts src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts
-      - name: Collect the validated result
+      - name: Collect the validated result without unrelated generated files
         run: |
-          git diff --check
           python3 - <<'PY'
           import hashlib, json, shutil, subprocess
           from pathlib import Path
+          generated = json.loads(Path('upstream-generated-files.json').read_text())
+          for path in generated:
+              Path(path).write_bytes(subprocess.check_output(['git', 'show', 'HEAD:' + path]))
+          subprocess.run(['git', 'diff', '--check'], check=True)
           paths = [
-            'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts',
-            'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts',
+              'src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts',
+              'src/vs/workbench/contrib/multiDiffEditor/test/browser/multiDiffEditorInput.test.ts',
           ]
           actual = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           assert set(actual) == set(paths), actual
@@ -113,6 +155,16 @@ jobs:
         with:
           name: multidiff-319859-validated-candidate
           path: candidate
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: multidiff-319859-generation-evidence
+          path: |
+            upstream-compile.log
+            candidate-compile.log
+            upstream-generated.patch
+            upstream-generated-files.json
           retention-days: 7
   stage-candidate:
     needs: validate
