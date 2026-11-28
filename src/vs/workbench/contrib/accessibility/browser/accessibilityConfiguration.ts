@@ -77,6 +77,7 @@ export const enum AccessibilityVerbositySettingId {
 	Find = 'accessibility.verbosity.find',
 	SessionsChat = 'accessibility.verbosity.sessionsChat',
 	SessionWorktreeCleanup = 'accessibility.verbosity.sessionWorktreeCleanup',
+	SessionWorkspaceEditor = 'accessibility.verbosity.sessionWorkspaceEditor',
 	NewSessionWelcome = 'accessibility.verbosity.newSessionWelcome',
 	SessionsChanges = 'accessibility.verbosity.sessionsChanges',
 	EmptyFileEditorSearch = 'accessibility.verbosity.emptyFileEditorSearch',
@@ -91,7 +92,8 @@ export const enum AccessibilityVerbositySettingId {
 	BrowserElementCommenting = 'accessibility.verbosity.browserElementCommenting',
 	ScreenshotTool = 'accessibility.verbosity.screenshotTool',
 	ChatPetAchievements = 'accessibility.verbosity.chatPetAchievements',
-	ChatPetJumpGame = 'accessibility.verbosity.chatPetJumpGame'
+	ChatPetJumpGame = 'accessibility.verbosity.chatPetJumpGame',
+	ChatPlanNudge = 'accessibility.verbosity.chatPlanNudge'
 }
 
 const baseVerbosityProperty: IConfigurationPropertySchema = {
@@ -269,6 +271,10 @@ const configuration: IConfigurationNode = {
 			description: localize('verbosity.sessionWorktreeCleanup', 'Provide information about how to use the Manage Agent Session Storage editor when it is focused.'),
 			...baseVerbosityProperty
 		},
+		[AccessibilityVerbositySettingId.SessionWorkspaceEditor]: {
+			description: localize('verbosity.sessionWorkspaceEditor', "Provide information about how to use the Workspace editor when it is focused."),
+			...baseVerbosityProperty
+		},
 		[AccessibilityVerbositySettingId.NewSessionWelcome]: {
 			description: localize('verbosity.newSessionWelcome', "Announce the welcome message when a new session composer is shown."),
 			...baseVerbosityProperty
@@ -319,6 +325,10 @@ const configuration: IConfigurationNode = {
 		},
 		[AccessibilityVerbositySettingId.ChatPetAchievements]: {
 			description: localize('verbosity.chatPetAchievements', 'Provide information about how to access chat pet achievements accessibility help when the Achievements modal is focused.'),
+			...baseVerbosityProperty
+		},
+		[AccessibilityVerbositySettingId.ChatPlanNudge]: {
+			description: localize('verbosity.chatPlanNudge', 'Provide information about how to access the Copilot plan suggestion accessibility help menu when a suggestion is focused.'),
 			...baseVerbosityProperty
 		},
 		[AccessibilityVerbositySettingId.ChatPetJumpGame]: {

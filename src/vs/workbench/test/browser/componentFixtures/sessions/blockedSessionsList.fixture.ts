@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { ISessionAgentMergeService, SessionAgentMergeService } from '../../../../contrib/sessions/browser/sessionAgentMerge.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ThemeIcon, themeColorFromId } from '../../../../../base/common/themables.js';
@@ -24,7 +25,7 @@ import { ISessionsListModelService } from '../../../../contrib/sessions/browser/
 import { ISessionsProvidersService } from '../../../../contrib/sessions/browser/sessionsProvidersService.js';
 import { BlockedSessionsList, registerBlockedSessionsItemActions } from '../../../../../sessions/contrib/sessions/browser/blockedSessionsList.js';
 import { registerBlockedSessionsHeaderActions, registerBlockedSessionsHeaderCommands } from '../../../../../sessions/contrib/sessions/browser/sessionsTitleBarWidget.js';
-import { ISessionCIFixModel, ISessionCIFixState } from '../../../../contrib/sessions/browser/views/sessionsList.js';
+import { ISessionCIFixModel, ISessionCIFixState } from '../../../../contrib/sessions/browser/views/sessionsListRenderers.js';
 import { IVoicePlaybackService } from '../../../../contrib/chat/common/voicePlaybackService.js';
 import { IChatService } from '../../../../contrib/chat/common/chatService/chatService.js';
 import { IChatModel } from '../../../../contrib/chat/common/model/chatModel.js';
@@ -263,6 +264,7 @@ function renderBlockedList(ctx: ComponentFixtureContext, sessions: readonly ISes
 			reg.defineInstance(ISessionsManagementService, new class extends mock<ISessionsManagementService>() {
 				override markRead(): Promise<void> { return Promise.resolve(); }
 			}());
+			reg.define(ISessionAgentMergeService, SessionAgentMergeService);
 			reg.defineInstance(ISessionsProvidersService, new class extends mock<ISessionsProvidersService>() {
 				override readonly onDidChangeProviders = Event.None;
 				override getProviders() { return []; }

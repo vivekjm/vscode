@@ -11,8 +11,9 @@ import { isEqual } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { ISession, isSessionArchiveConfirmed } from '../../../services/sessions/common/session.js';
+import { IMigratedSessionsListState, readMachineSessionsListState, storeMachineSessionsListState } from '../../../services/sessions/common/sessionsListStorage.js';
 import { ISessionsManagementService } from '../common/sessionsManagement.js';
 import { ISessionSectionOrderService, ISessionSectionPositions, resolveSectionOrder, restoreSectionOrderPositions, spliceSectionOrder } from '../../../services/sessions/browser/sessionSectionOrderService.js';
 
@@ -20,7 +21,7 @@ import { ISessionSectionOrderService, ISessionSectionPositions, resolveSectionOr
 export interface ISessionGroupAppearance {
 	/** Theme icon id chosen by the user. */
 	readonly icon?: string;
-	/** Theme color id applied to the group icon and name. */
+	/** Color applied to the group icon and name: a theme color id, or a custom `#rrggbb` that the Workspace editor picks. */
 	readonly color?: string;
 }
 
@@ -166,7 +167,8 @@ export class SessionGroupTree {
 /**
  * Service that owns user-created session groups, their nesting, the order of
  * each group's subgroups and grouping sections, and the mapping of sessions to groups. State is
- * purely local (persisted to profile storage) and not synced to providers.
+ * purely local: persisted to the profile's machine storage, it is neither synced to providers
+ * nor roamed across devices by Settings Sync.
  * Top-level groups share their order with the sessions list's other top-level
  * headers, which the list arranges in {@link ISessionSectionOrderService}.
  *
@@ -211,7 +213,7 @@ export interface ISessionGroupsService {
 	/** Set a group's icon, or restore the default with `undefined`. */
 	setGroupIcon(groupId: string, icon: string | undefined): void;
 
-	/** Set a group's icon and name color, or restore the default with `undefined`. */
+	/** Set a group's icon and name color, a theme color id or a custom `#rrggbb`, or restore the default with `undefined`. */
 	setGroupColor(groupId: string, color: string | undefined): void;
 
 	/** Appearance of a workspace, repository, or environment section, keyed by its stable section id. */
@@ -243,6 +245,13 @@ export interface ISessionGroupsService {
 
 	/** Nest a grouping section in a custom group, or return it to the top level. */
 	moveSection(sectionId: string, parentId: string | undefined, placement?: ISessionGroupPlacement): void;
+
+	/**
+	 * Gives a grouping section's placement in a custom group, and its place among the group's rows, to the section's new id,
+	 * such as a workspace's after its file was renamed. A placement the new id has already stays. The groups themselves do not
+	 * change, so the change notes none.
+	 */
+	renameSection(sectionId: string, newSectionId: string): void;
 
 	/**
 	 * Delete a group and its subgroups at any depth, removing their sessions'
@@ -315,11 +324,63 @@ interface ISerializedState {
 	readonly subgroupOrders?: Readonly<Record<string, readonly string[]>>;
 }
 
+/**
+ * Whether stored groups state holds anything the user made: groups or section appearance.
+ * Sessions left ungrouped alone are bookkeeping that every load stores for archived sessions,
+ * and that remains once the last group is deleted, so they do not make the device own its state.
+ */
+function isUserMadeGroupsState(state: Partial<ISerializedState> | null | undefined): boolean {
+	return !!state && ((Array.isArray(state.groups) && state.groups.length > 0) || (!!state.sectionAppearance && typeof state.sectionAppearance === 'object' && Object.keys(state.sectionAppearance).length > 0));
+}
+
+function parseGroupsState(raw: string | undefined): Partial<ISerializedState> | undefined {
+	if (raw === undefined) {
+		return undefined;
+	}
+	try {
+		const state: unknown = JSON.parse(raw);
+		return state && typeof state === 'object' ? state as Partial<ISerializedState> : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function getExplicitlyUngroupedSessionIds(state: Partial<ISerializedState> | undefined): string[] {
+	const sessionIds = state?.[EXPLICITLY_UNGROUPED_FIELD];
+	return Array.isArray(sessionIds) ? sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string') : [];
+}
+
+/**
+ * Combines the groups state that older builds synced with this device's. Synced state the user
+ * made is adopted, and sessions this device left ungrouped stay ungrouped in it. Otherwise only
+ * the sessions either left ungrouped are kept, without the device owning its state: they keep
+ * sessions from joining the group of the session that created them once groups exist again.
+ */
+function migrateSyncedGroupsState(syncedRaw: string, raw: string | undefined): IMigratedSessionsListState {
+	const synced = parseGroupsState(syncedRaw);
+	const local = parseGroupsState(raw);
+	const localUngrouped = getExplicitlyUngroupedSessionIds(local);
+	if (synced && isUserMadeGroupsState(synced)) {
+		const membership: Record<string, string> = synced.membership && typeof synced.membership === 'object' ? { ...synced.membership } : {};
+		for (const sessionId of localUngrouped) {
+			delete membership[sessionId];
+		}
+		const ungrouped = [...new Set([...getExplicitlyUngroupedSessionIds(synced), ...localUngrouped])];
+		return { value: JSON.stringify({ ...synced, membership, [EXPLICITLY_UNGROUPED_FIELD]: ungrouped }), userMade: true };
+	}
+	const ungrouped = [...new Set([...localUngrouped, ...getExplicitlyUngroupedSessionIds(synced)])];
+	if (ungrouped.length === localUngrouped.length) {
+		return { value: raw, userMade: false };
+	}
+	return { value: JSON.stringify({ groups: [], membership: {}, ...local, [EXPLICITLY_UNGROUPED_FIELD]: ungrouped }), userMade: false };
+}
+
 export class SessionGroupsService extends Disposable implements ISessionGroupsService {
 
 	declare readonly _serviceBrand: undefined;
 
-	private static readonly STORAGE_KEY = 'sessionsListControl.groups';
+	private static readonly STORAGE_KEY = 'sessionsListControl.localGroups';
+	private static readonly LEGACY_SYNCED_STORAGE_KEY = 'sessionsListControl.groups';
 
 	private readonly _onDidChange = this._register(new Emitter<ISessionGroupsChangeEvent>());
 	readonly onDidChange: Event<ISessionGroupsChangeEvent> = this._onDidChange.event;
@@ -755,6 +816,27 @@ export class SessionGroupsService extends Disposable implements ISessionGroupsSe
 		this._onDidChange.fire({ groupsChanged: true, membershipChanged: new Set() });
 	}
 
+	renameSection(sectionId: string, newSectionId: string): void {
+		const parentId = this._sectionMembership.get(sectionId);
+		if (parentId === undefined || sectionId === newSectionId) {
+			return;
+		}
+		this._sectionMembership.delete(sectionId);
+		const order = this._childOrders.get(parentId);
+		if (this._sectionMembership.has(newSectionId)) {
+			if (order) {
+				this._childOrders.set(parentId, order.filter(id => id !== sectionId));
+			}
+		} else {
+			this._sectionMembership.set(newSectionId, parentId);
+			if (order) {
+				this._childOrders.set(parentId, order.map(id => id === sectionId ? newSectionId : id));
+			}
+		}
+		this.save();
+		this._onDidChange.fire({ groupsChanged: false, membershipChanged: new Set() });
+	}
+
 	private reorderChild(childId: string, parentId: string, placement: ISessionGroupPlacement | undefined): boolean {
 		const currentOrder = this.getChildIds(parentId);
 		const siblingIds = currentOrder.filter(id => id !== childId);
@@ -1015,7 +1097,7 @@ export class SessionGroupsService extends Disposable implements ISessionGroupsSe
 	// -- Storage --
 
 	private load(): void {
-		const raw = this.storageService.get(SessionGroupsService.STORAGE_KEY, StorageScope.PROFILE);
+		const raw = readMachineSessionsListState(this.storageService, SessionGroupsService.STORAGE_KEY, SessionGroupsService.LEGACY_SYNCED_STORAGE_KEY, migrateSyncedGroupsState);
 		if (!raw) {
 			return;
 		}
@@ -1083,7 +1165,7 @@ export class SessionGroupsService extends Disposable implements ISessionGroupsSe
 		// Invalidate derived children before synchronous change listeners query the updated state.
 		this._defaultChildIds = undefined;
 		if (this._groups.size === 0 && this._explicitlyUngroupedSessionIds.size === 0 && this._sectionAppearance.size === 0) {
-			this.storageService.remove(SessionGroupsService.STORAGE_KEY, StorageScope.PROFILE);
+			storeMachineSessionsListState(this.storageService, SessionGroupsService.STORAGE_KEY, undefined, false);
 			return;
 		}
 		const childOrders = this.getLiveChildOrders();
@@ -1095,7 +1177,7 @@ export class SessionGroupsService extends Disposable implements ISessionGroupsSe
 			[EXPLICITLY_UNGROUPED_FIELD]: [...this._explicitlyUngroupedSessionIds],
 			...(childOrders.length > 0 ? { subgroupOrders: Object.fromEntries(childOrders) } : {}),
 		};
-		this.storageService.store(SessionGroupsService.STORAGE_KEY, JSON.stringify(state), StorageScope.PROFILE, StorageTarget.USER);
+		storeMachineSessionsListState(this.storageService, SessionGroupsService.STORAGE_KEY, JSON.stringify(state), isUserMadeGroupsState(state));
 	}
 
 	/** The child orders of existing groups, with only their current subgroups and grouping sections. */

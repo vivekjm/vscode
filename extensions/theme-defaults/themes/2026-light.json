@@ -193,6 +193,9 @@
 		"statusBarItem.activeBackground": "#EEEEEE",
 		"statusBarItem.hoverBackground": "#E3E3E5",
 		"statusBarItem.focusBorder": "#0069CC",
+		"statusBarItem.remoteBackground": "#0069CC",
+		"statusBarItem.remoteHoverBackground": "#0063C1",
+		"statusBarItem.remoteHoverForeground": "#FFFFFF",
 		"statusBarItem.prominentBackground": "#0069CCDD",
 		"statusBarItem.prominentForeground": "#FFFFFF",
 		"statusBarItem.prominentHoverBackground": "#0069CC",
@@ -383,9 +386,12 @@
 			}
 		},
 		{
-			"scope": "keyword",
+			"scope": [
+				"keyword",
+				"keyword.control"
+			],
 			"settings": {
-				"foreground": "#cf222e"
+				"foreground": "#0550ae"
 			}
 		},
 		{
@@ -394,7 +400,7 @@
 				"storage.type"
 			],
 			"settings": {
-				"foreground": "#cf222e"
+				"foreground": "#0550ae"
 			}
 		},
 		{

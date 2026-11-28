@@ -6,8 +6,9 @@
 import { constObservable, IObservable, IReader } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { IChat, ISession, ISessionChangeset, ISessionChangesetOperation, ISessionChangesSummary, ISessionFileChange } from '../../../services/sessions/common/session.js';
+import { IChat, ISession, ISessionChangeset, ISessionChangesetFolderFailure, ISessionChangesetOperation, ISessionChangesSummary, ISessionFileChange } from '../../../services/sessions/common/session.js';
 import { ChangesViewMode, IsolationMode } from './changes.js';
+import type { IChangesRepository, IChangesRepositoryGroup } from './changesRepositories.js';
 
 export interface ActiveSessionState {
 	readonly isolationMode: IsolationMode;
@@ -73,8 +74,17 @@ export interface IChangesSessionObservables {
 	readonly changesSummaryObs: IObservable<ISessionChangesSummary | undefined>;
 	readonly sectionCollapseStateObs: IObservable<IChangesViewSectionCollapseState>;
 	readonly stateObs: IObservable<ActiveSessionState | undefined>;
-	/** The recorded base branch of the chat's primary folder (e.g. `origin/main`), read live and never retained across sessions. */
-	readonly baseBranchFullNameObs: IObservable<string | undefined>;
+	/** The base branch ref of the chat's primary folder (e.g. `refs/remotes/origin/main`), read live and never retained across sessions. */
+	readonly baseBranchRefObs: IObservable<string | undefined>;
+	/** The repositories the changes are grouped by; empty when they are not grouped (see the service's grouping). */
+	readonly repositoriesObs: IObservable<readonly IChangesRepository[]>;
+	/** The repository whose changes {@link changesObs} has; `undefined` for all of them. */
+	readonly repositoryObs: IObservable<IChangesRepository | undefined>;
+	/**
+	 * The changeset whose changeset-scoped operations {@link changesetOperationsObs} has: that of {@link repositoryObs} on its
+	 * own, with its Git state, base branch and pull request, else {@link changesetObs}.
+	 */
+	readonly operationsChangesetObs: IObservable<ISessionChangeset | undefined>;
 }
 
 /** The session a changes view or actions bar acts on, with that session's changes observables. */
@@ -133,7 +143,10 @@ export function getActiveSessionChanges(service: IChangesViewService): IChangesS
 		changesSummaryObs: service.activeSessionChangesSummaryObs,
 		sectionCollapseStateObs: service.activeSessionSectionCollapseStateObs,
 		stateObs: service.activeSessionStateObs,
-		baseBranchFullNameObs: service.activeSessionBaseBranchFullNameObs,
+		baseBranchRefObs: service.activeSessionBaseBranchRefObs,
+		repositoriesObs: service.activeSessionRepositoriesObs,
+		repositoryObs: service.activeSessionRepositoryObs,
+		operationsChangesetObs: service.activeSessionOperationsChangesetObs,
 	};
 }
 
@@ -171,10 +184,28 @@ export interface IChangesViewService {
 	readonly activeSessionReviewCommentCountByFileObs: IObservable<Map<string, number>>;
 	readonly activeSessionAgentFeedbackCountByFileObs: IObservable<Map<string, number>>;
 	readonly activeSessionStateObs: IObservable<ActiveSessionState | undefined>;
-	/** The recorded base branch of the active chat's primary folder (e.g. `origin/main`), read live and never retained across sessions. */
-	readonly activeSessionBaseBranchFullNameObs: IObservable<string | undefined>;
+	/** The base branch ref of the active chat's primary folder (e.g. `refs/remotes/origin/main`), read live and never retained across sessions. */
+	readonly activeSessionBaseBranchRefObs: IObservable<string | undefined>;
 	readonly activeSessionLoadingObs: IObservable<boolean>;
 	readonly activeSessionSectionCollapseStateObs: IObservable<IChangesViewSectionCollapseState>;
+	readonly activeSessionRepositoriesObs: IObservable<readonly IChangesRepository[]>;
+	readonly activeSessionRepositoryObs: IObservable<IChangesRepository | undefined>;
+	readonly activeSessionOperationsChangesetObs: IObservable<ISessionChangeset | undefined>;
+
+	/**
+	 * Shows the changes of one repository (by its root) of `chat` of `session`, which default to those of the main window,
+	 * or of all of them (`undefined`). It filters the selected changeset; the changeset stays selected.
+	 */
+	setRepository(repositoryRoot: URI | undefined, session?: ISession, chat?: IChat): void;
+
+	/** Why the changes of `repository` could not be loaded, among the `failures` a changeset reports per folder, if they could not. */
+	findRepositoryFailure(repository: IChangesRepository, failures: readonly ISessionChangesetFolderFailure[]): ISessionChangesetFolderFailure | undefined;
+
+	/**
+	 * Groups items by the repositories of a session's Changes, in repository order, with those outside every repository last.
+	 * A repository whose changes failed is listed with its failure, also without items; one without items otherwise is left out.
+	 */
+	groupByRepository<T>(items: readonly T[], getResource: (item: T) => URI, repositories: readonly IChangesRepository[], failures?: readonly ISessionChangesetFolderFailure[]): IChangesRepositoryGroup<T>[];
 
 	/** Selects the changeset of `chat` of `session`, which default to those of the main window. */
 	setChangesetId(changesetId: string | undefined, session?: ISession, chat?: IChat): void;

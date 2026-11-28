@@ -133,6 +133,15 @@ function ownChatProvider(sessionProvider: string | undefined, provider: string |
 	return provider !== undefined && provider !== sessionProvider ? provider : undefined;
 }
 
+/**
+ * The `modifiedAt` of a session or chat that was just archived or unarchived: now, never before `current`.
+ * Archiving counts as an update, so lists ordered by update time order archived items by when they were archived.
+ */
+function archivedModifiedAt(current: string): string {
+	const currentTime = Date.parse(current);
+	return new Date(Number.isFinite(currentTime) ? Math.max(Date.now(), currentTime) : Date.now()).toISOString();
+}
+
 interface IRestoredChatState {
 	readonly turns: Turn[];
 	readonly draft?: Message;
@@ -1458,7 +1467,8 @@ export class AgentHostStateManager extends Disposable {
 	 * without subscribing to every session.
 	 *
 	 * No-ops for a live session (the reducer owns that), one never announced, or
-	 * a flag already in the requested position.
+	 * a flag already in the requested position. Changing {@link SessionStatus.IsArchived}
+	 * advances its `modifiedAt`, as archiving a live session does.
 	 */
 	setSurfacedSessionStatusFlag(session: string, flag: SessionStatus, set: boolean): void {
 		if (this._sessionStates.has(session)) {
@@ -1472,15 +1482,23 @@ export class AgentHostStateManager extends Disposable {
 		if (status === announced.status) {
 			return;
 		}
-		this._summaryNotifier.applyAnnouncedChanges(session, { status });
+		this._summaryNotifier.applyAnnouncedChanges(session, {
+			status,
+			...(flag === SessionStatus.IsArchived ? { modifiedAt: archivedModifiedAt(announced.modifiedAt) } : {}),
+		});
 	}
 
-	/** Updates passive status metadata and optional exact chat read state for an unloaded session. */
-	setSurfacedSessionStatusAndChats(session: string, status: SessionStatus, chats?: SessionSummary['chats']): void {
-		if (!this._sessionStates.has(session) && this._summaryNotifier.getAnnounced(session)) {
+	/**
+	 * Updates passive status metadata and optional exact chat read state for an unloaded session. `archivedChanged`
+	 * advances its `modifiedAt`, as archiving a live session or chat does.
+	 */
+	setSurfacedSessionStatusAndChats(session: string, status: SessionStatus, chats?: SessionSummary['chats'], archivedChanged = false): void {
+		const announced = this._summaryNotifier.getAnnounced(session);
+		if (!this._sessionStates.has(session) && announced) {
 			this._summaryNotifier.applyAnnouncedChanges(session, {
 				status,
 				...(chats ? { chats } : {}),
+				...(archivedChanged ? { modifiedAt: archivedModifiedAt(announced.modifiedAt) } : {}),
 			});
 		}
 	}
@@ -1621,6 +1639,8 @@ export class AgentHostStateManager extends Disposable {
 		this._dataOnlySessions.add(summary.resource);
 		const restoredState = this._registerRestoredSession(summary, chatStorageResource, (key, chat, storageResource) => {
 			const chatSummary = this._defaultChatSummary(chat, summary, defaultChat.title, defaultChat.modifiedAt, defaultChat.workingDirectories, defaultChat.isRead);
+			// List the chat in state.chats before firing onDidRegisterChat: its listeners may dispatch session actions, which drop unlisted chats
+			this._setDefaultChatSummary(key, chat, chatSummary);
 			this._setChatEntry(chat, {
 				session: key,
 				storageResource,
@@ -1633,7 +1653,6 @@ export class AgentHostStateManager extends Disposable {
 				resolver: defaultChat.resolver,
 				valid: true,
 			});
-			this._setDefaultChatSummary(key, chat, chatSummary);
 		});
 		this._logService.trace(`[AgentHostStateManager] Restored the data of session ${summary.resource} for a move`);
 		return restoredState;
@@ -1710,6 +1729,8 @@ export class AgentHostStateManager extends Disposable {
 	 */
 	private _ensureDefaultChat(sessionKey: string, chatUri: URI, summary: SessionSummary, storageResource: string, turns?: Turn[], draft?: Message, defaultChatTitle?: string, modifiedAt?: string, workingDirectories?: readonly string[], isRead?: boolean, config?: ChatConfigState): void {
 		const chatSummary = this._defaultChatSummary(chatUri, summary, defaultChatTitle, modifiedAt, workingDirectories, isRead);
+		// List the chat in state.chats before firing onDidRegisterChat: its listeners may dispatch session actions, which drop unlisted chats
+		this._setDefaultChatSummary(sessionKey, chatUri, chatSummary);
 		this._setChatEntry(chatUri, {
 			session: sessionKey,
 			storageResource,
@@ -1720,7 +1741,6 @@ export class AgentHostStateManager extends Disposable {
 			config,
 			valid: true,
 		});
-		this._setDefaultChatSummary(sessionKey, chatUri, chatSummary);
 	}
 
 	private _defaultChatSummary(chatUri: URI, summary: SessionSummary, defaultChatTitle: string | undefined, modifiedAt: string | undefined, workingDirectories: readonly string[] | undefined, isRead: boolean | undefined): ChatSummary {
@@ -3004,6 +3024,11 @@ export class AgentHostStateManager extends Disposable {
 				const newState = sessionReducer(previousState, sessionAction, this._log);
 				const summaryChanged = !this._summaryFieldsEqual(previousState, newState);
 				entry.state = newState;
+				const archivedChanged = sessionAction.type === ActionType.SessionIsArchivedChanged
+					&& isSessionStatusArchived(previousState.status) !== isSessionStatusArchived(newState.status);
+				if (archivedChanged) {
+					entry.modifiedAt = archivedModifiedAt(entry.modifiedAt);
+				}
 				this._synchronizeChatEntries(key, newState.chats);
 				const aggregateChats = newState.chats.filter(chat => isChatInSessionReadAggregate(chat.resource, chat.origin, chat.interactivity));
 				if (sessionAction.type === ActionType.SessionIsReadChanged && !sessionAction.isRead && aggregateChats.length === 1) {
@@ -3023,7 +3048,7 @@ export class AgentHostStateManager extends Disposable {
 
 				// When the reducer touched a summary-relevant field, notify
 				// root-channel clients of the derived-summary delta.
-				if (summaryChanged) {
+				if (summaryChanged || archivedChanged) {
 					this._summaryNotifier.markDirty(key);
 				}
 
@@ -3046,7 +3071,10 @@ export class AgentHostStateManager extends Disposable {
 			const chat = chatEntry?.state;
 			let readTransition: { readonly wasRead: boolean; readonly isRead: boolean } | undefined;
 			if (chat && chatEntry && sessionKey !== undefined) {
-				const newChat = chatReducer(chat, chatAction, this._log);
+				let newChat = chatReducer(chat, chatAction, this._log);
+				if (chatAction.type === ActionType.ChatIsArchivedChanged && isSessionStatusArchived(chat.status) !== isSessionStatusArchived(newChat.status)) {
+					newChat = { ...newChat, modifiedAt: archivedModifiedAt(chat.modifiedAt) };
+				}
 				chatEntry.state = newChat;
 				if (chatAction.type === ActionType.ChatMoved) {
 					// Its values are unchanged; only the schema it publishes follows its new owner.
@@ -3077,7 +3105,8 @@ export class AgentHostStateManager extends Disposable {
 				const status = chatAction.type === ActionType.ChatIsReadChanged
 					? withSessionStatusFlag(summary.status, SessionStatus.IsRead, chatAction.isRead)
 					: withSessionStatusFlag(summary.status, SessionStatus.IsArchived, chatAction.isArchived);
-				this._onChatSummaryChanged(sessionKey, channel, { ...summary, status });
+				const archivedChanged = isSessionStatusArchived(summary.status) !== isSessionStatusArchived(status);
+				this._onChatSummaryChanged(sessionKey, channel, { ...summary, status, ...(archivedChanged ? { modifiedAt: archivedModifiedAt(summary.modifiedAt) } : {}) });
 				if (chatAction.type === ActionType.ChatIsReadChanged) {
 					readTransition = { wasRead: isSessionStatusRead(summary.status), isRead: isSessionStatusRead(status) };
 				}

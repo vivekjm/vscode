@@ -10,7 +10,7 @@ import { CancellationError } from '../../../../base/common/errors.js';
 import { OperatingSystem, OS } from '../../../../base/common/platform.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { DevContainerCloseConnectionNotification, DevContainerConnectEnvironmentExtensionMethod, DevContainerConnectExtensionMethod, DevContainerDisconnectExtensionMethod, DevContainerIsDockerAvailableExtensionMethod, DevContainerOutputNotification, DevContainerSandboxSupportNotification, DevContainerRelayCloseNotification, DevContainerRelayMessageNotification, DevContainerRelaySendExtensionMethod, DevContainerRemoveEnvironmentExtensionMethod, DevContainerRemoveExtensionMethod, DevContainerStopExtensionMethod, DevContainerUserStateNotification } from '../../common/agentHostExtensionProtocol.js';
+import { DevContainerCloseConnectionNotification, DevContainerConnectEnvironmentExtensionMethod, DevContainerConnectExtensionMethod, DevContainerConnectFailureNotification, DevContainerDisconnectExtensionMethod, DevContainerGetEnginesExtensionMethod, DevContainerIsDockerAvailableExtensionMethod, DevContainerListFolderContainersExtensionMethod, DevContainerOutputNotification, DevContainerSandboxSupportNotification, DevContainerRelayCloseNotification, DevContainerRelayMessageNotification, DevContainerRelaySendExtensionMethod, DevContainerRemoveEnvironmentExtensionMethod, DevContainerRemoveExtensionMethod, DevContainerStopExtensionMethod, DevContainerUserStateNotification, type IAgentHostExtensionCommandMap } from '../../common/agentHostExtensionProtocol.js';
 import { devContainerEnvironmentImage } from '../../common/devContainerEnvironments.js';
 import type { IDevContainerAgentHostConnectResult } from '../../common/devContainerAgentHost.js';
 import { AhpErrorCodes, JsonRpcErrorCodes, ProtocolError } from '../../common/state/sessionProtocol.js';
@@ -63,6 +63,53 @@ suite('DevContainerAgentHostProtocol', () => {
 		assert.strictEqual(service.connects[0].sandboxEnabled, true);
 	});
 
+	test('reports container engines by normalized source and forwards the engine of new containers', async () => {
+		const { service, protocol } = setup();
+		service.engines = { available: ['docker', 'wslc'], existing: 'wslc' };
+		const workspaceFolder = '/C:/repo';
+		const engines = await protocol.handleRequest(DevContainerGetEnginesExtensionMethod, { workspaceFolder });
+		await protocol.handleRequest(DevContainerGetEnginesExtensionMethod, { environmentId: 'environment-1' });
+		await protocol.handleRequest(DevContainerGetEnginesExtensionMethod, undefined);
+		await protocol.handleRequest(DevContainerConnectExtensionMethod, { ...config, engine: 'wslc' });
+		await protocol.handleRequest(DevContainerConnectEnvironmentExtensionMethod, { connectionId: 'environment-connection', environmentId: 'environment-1', image: devContainerEnvironmentImage, name: 'Dev Container on Build', engine: 'wslc' });
+		for (const [method, params] of [
+			[DevContainerGetEnginesExtensionMethod, { environmentId: '../escape' }],
+			[DevContainerGetEnginesExtensionMethod, { workspaceFolder: 'relative' }],
+			[DevContainerGetEnginesExtensionMethod, { workspaceFolder, environmentId: 'environment-1' }],
+			[DevContainerConnectExtensionMethod, { ...config, connectionId: 'unknown-engine', engine: 'podman' }],
+		] as const) {
+			await assert.rejects(protocol.handleRequest(method, params)!, error => error instanceof ProtocolError && error.code === JsonRpcErrorCodes.InvalidParams);
+		}
+		assert.deepStrictEqual({ engines, sources: service.engineSources, connectEngines: service.connects.map(config => config.engine) }, {
+			engines: { available: ['docker', 'wslc'], existing: 'wslc' },
+			sources: [normalizeDevContainerWorkspaceFolder(workspaceFolder, OS), { environmentId: 'environment-1' }, undefined],
+			connectEngines: ['wslc', 'wslc'],
+		});
+	});
+
+	test('the remote client asks hosts with the engines capability for their engines, and older hosts only for Docker', async () => {
+		let supported = false;
+		const requests: string[] = [];
+		const responses: Partial<Record<keyof IAgentHostExtensionCommandMap, unknown>> = {
+			[DevContainerIsDockerAvailableExtensionMethod]: true,
+			// A newer host's engines that this client does not know are ignored.
+			[DevContainerGetEnginesExtensionMethod]: { available: ['docker', 'wslc', 'other'], existing: 'wslc' },
+		};
+		const client = store.add(new DevContainerAgentHostProtocolClient(async <M extends keyof IAgentHostExtensionCommandMap>(method: M, params: IAgentHostExtensionCommandMap[M]['params']) => {
+			requests.push(`${method} ${JSON.stringify(params)}`);
+			return responses[method] as IAgentHostExtensionCommandMap[M]['result'];
+		}, () => supported));
+		const older = await client.getEngines('/repo');
+		await assert.rejects(client.connect({ ...config, engine: 'wslc' }), /only supports Docker/);
+		supported = true;
+		const newer = await client.getEngines({ environmentId: 'environment-1' });
+		assert.deepStrictEqual({ older, newer, requests }, {
+			older: { available: ['docker'] },
+			newer: { available: ['docker', 'wslc'], existing: 'wslc' },
+			requests: [`${DevContainerIsDockerAvailableExtensionMethod} undefined`, `${DevContainerGetEnginesExtensionMethod} {"environmentId":"environment-1"}`],
+		});
+	});
+
 	test('starts and removes environments without workspace trust, rejecting unsupported images and identifiers', async () => {
 		const trustRequests: string[] = [];
 		const { service, protocol } = setup(async workspace => { trustRequests.push(workspace); return false; });
@@ -91,15 +138,20 @@ suite('DevContainerAgentHostProtocol', () => {
 		await Promise.resolve();
 		service.sandboxSupport.fire({ connectionId: service.connects[0].connectionId, supported: false });
 		service.userState.fire({ connectionId: service.connects[0].connectionId, stage: 'link', outcome: 'failed', reason: 'script', exitCode: 1 });
+		service.connectFailure.fire({ connectionId: service.connects[0].connectionId, stage: 'link' });
 		await result.error(new Error('Unsupported sandbox startup'));
 		await rejected;
 		service.userState.fire({ connectionId: service.connects[0].connectionId, stage: 'userCommands', outcome: 'succeeded' });
+		service.connectFailure.fire({ connectionId: service.connects[0].connectionId, stage: 'connect' });
 		assert.deepStrictEqual(notifications, [{
 			method: DevContainerSandboxSupportNotification,
 			params: { connectionId: config.connectionId, supported: false },
 		}, {
 			method: DevContainerUserStateNotification,
 			params: { connectionId: config.connectionId, stage: 'link', outcome: 'failed', reason: 'script', exitCode: 1 },
+		}, {
+			method: DevContainerConnectFailureNotification,
+			params: { connectionId: config.connectionId, stage: 'link' },
 		}]);
 	});
 
@@ -112,16 +164,21 @@ suite('DevContainerAgentHostProtocol', () => {
 		const observed: unknown[] = [];
 		store.add(client.onDidChangeSandboxSupport(event => observed.push(event.supported)));
 		store.add(client.onDidReportUserState(event => observed.push(event)));
+		store.add(client.onDidFailConnect(event => observed.push(event)));
 		const request = client.connect(config);
 		const rejected = assert.rejects(request, /Unsupported sandbox startup/);
 		client.handleNotification(DevContainerSandboxSupportNotification, { connectionId: config.connectionId, supported: false });
 		client.handleNotification(DevContainerUserStateNotification, { connectionId: config.connectionId, stage: 'mount', outcome: 'failed', reason: 'volume', target: 'workspaces' });
+		client.handleNotification(DevContainerUserStateNotification, { connectionId: config.connectionId, stage: 'link', outcome: 'failed', reason: 'script', scriptUser: 'root', capChown: false, capDacReadSearch: true, stateOwner: 'user', privileged: false, runtime: 'gvisor' });
 		client.handleNotification(DevContainerUserStateNotification, { connectionId: config.connectionId, stage: 'unknown', outcome: 'failed' });
+		client.handleNotification(DevContainerConnectFailureNotification, { connectionId: config.connectionId, stage: 'agentHostStart' });
+		client.handleNotification(DevContainerConnectFailureNotification, { connectionId: config.connectionId, stage: 'unknown' });
 		await pending.complete();
 		await rejected;
 		client.handleNotification(DevContainerSandboxSupportNotification, { connectionId: config.connectionId, supported: true });
 		client.handleNotification(DevContainerUserStateNotification, { connectionId: config.connectionId, stage: 'userCommands', outcome: 'succeeded' });
-		assert.deepStrictEqual(observed, [false, { connectionId: config.connectionId, stage: 'mount', outcome: 'failed', reason: 'volume', target: 'workspaces' }]);
+		client.handleNotification(DevContainerConnectFailureNotification, { connectionId: config.connectionId, stage: 'connect' });
+		assert.deepStrictEqual(observed, [false, { connectionId: config.connectionId, stage: 'mount', outcome: 'failed', reason: 'volume', target: 'workspaces' }, { connectionId: config.connectionId, stage: 'link', outcome: 'failed', reason: 'script', scriptUser: 'root', capChown: false, capDacReadSearch: true, stateOwner: 'user', privileged: false, runtime: 'gvisor' }, { connectionId: config.connectionId, stage: 'agentHostStart' }]);
 	});
 
 	test('isolates IDs and notifications between transports', async () => {
@@ -222,6 +279,30 @@ suite('DevContainerAgentHostProtocol', () => {
 		const { service, protocol } = setup();
 		await protocol.handleRequest(DevContainerConnectExtensionMethod, { ...config, resume: true });
 		assert.strictEqual(service.connects[0].resume, true);
+	});
+
+	test('lists folder containers without workspace trust and forwards connecting only to a running one', async () => {
+		const trustRequests: string[] = [];
+		const { service, protocol } = setup(async workspace => { trustRequests.push(workspace); return true; });
+		service.folderContainers = [{ folder: 'file:///repo', running: true }];
+		const listed = await protocol.handleRequest(DevContainerListFolderContainersExtensionMethod, undefined);
+		await protocol.handleRequest(DevContainerConnectExtensionMethod, { ...config, requireRunning: true });
+		const responses: unknown[] = [[{ folder: 'file:///repo', running: false }], [{ folder: 'file:///repo' }]];
+		const client = store.add(new DevContainerAgentHostProtocolClient(async <M extends keyof IAgentHostExtensionCommandMap>() => responses.shift() as IAgentHostExtensionCommandMap[M]['result']));
+		assert.deepStrictEqual({
+			listed,
+			trustRequests: trustRequests.length,
+			requireRunning: hasKey(service.connects[0], { workspaceFolder: true }) ? service.connects[0].requireRunning : undefined,
+			clientListed: await client.listFolderContainers(),
+			invalid: await client.listFolderContainers().then(() => 'valid', (error: Error) => error.message),
+		}, {
+			listed: [{ folder: 'file:///repo', running: true }],
+			// Only the connection requests trust.
+			trustRequests: 1,
+			requireRunning: true,
+			clientListed: [{ folder: 'file:///repo', running: false }],
+			invalid: 'Invalid Dev Container folder containers response',
+		});
 	});
 
 	test('validates all extension request parameters', async () => {

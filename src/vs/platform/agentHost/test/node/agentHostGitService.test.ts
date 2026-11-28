@@ -4,12 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import * as fsPromises from 'fs/promises';
+import { execFile } from 'child_process';
 import { tmpdir } from 'os';
+import { join, relative, sep } from '../../../../base/common/path.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { AgentHostGitService, canRestageOntoIndexCopy, formatGitError, getRemoteTrackingRef, GitCheckoutProgressParser, isRetryableWorktreeRemovalError, parseChangedPaths, parseDefaultBranchRef, parseDefaultRemoteBranchRef, parseFetchRemoteUrls, parseGitDiffRawNumstat, parseGitHubRepoFromRemote, parseGitStatusV2, parseGitWorktrees, parseHasGitHubRemote, parseSingleLsTreeEntry, parseUntrackedPaths, selectDefaultPushRemote, summarizeStderrForError } from '../../node/agentHostGitService.js';
+import { AgentHostGitService, canRestageOntoIndexCopy, formatGitError, getWorktreeAddFailureMessage, GitCheckoutProgressParser, isRetryableWorktreeRemovalError, parseChangedPaths, parseDefaultBranchRef, parseDefaultRemoteBranchRef, parseFetchRemoteUrls, parseGitDiffRawNumstat, parseGitHubRepoFromRemote, parseGitStatusV2, parseGitWorktrees, parseHasGitHubRemote, parseSingleLsTreeEntry, parseUntrackedPaths, selectDefaultPushRemote, summarizeStderrForError } from '../../node/agentHostGitService.js';
 import { buildGitBlobUri } from '../../node/gitDiffContent.js';
 import { URI } from '../../../../base/common/uri.js';
-import { Branch, EMPTY_TREE_OBJECT, getBranchCompletions, GitRefType, IRefQuery, resolveDiffBaseBranchName } from '../../common/agentHostGitService.js';
+import { isWindows } from '../../../../base/common/platform.js';
+import { Branch, EMPTY_TREE_OBJECT, getBaseBranchLabel, getBranchCompletions, GitRefType, IRefQuery, parseBaseBranchRef } from '../../common/agentHostGitService.js';
 import { needsSessionGitStateRefresh } from '../../common/state/sessionState.js';
 import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
@@ -344,6 +348,73 @@ suite('AgentHostGitService', () => {
 		});
 	});
 
+	suite('findRepositories', () => {
+		let root: string;
+		// Where the Git directories of checkouts with a `.git` file live, outside the scanned folder
+		let gitDirs: string;
+
+		setup(async () => {
+			root = await fsPromises.mkdtemp(join(tmpdir(), 'agent-host-find-repositories-'));
+			gitDirs = await fsPromises.mkdtemp(join(tmpdir(), 'agent-host-find-repositories-gitdirs-'));
+		});
+
+		teardown(async () => {
+			await fsPromises.rm(root, { recursive: true, force: true });
+			await fsPromises.rm(gitDirs, { recursive: true, force: true });
+		});
+
+		const initRepository = (folder: string, ...args: string[]) => new Promise<void>((resolve, reject) => execFile('git', ['init', '-q', ...args, folder], error => error ? reject(error) : resolve()));
+
+		async function makeFolder(relative: string, options?: { readonly repository?: boolean; readonly gitFile?: boolean }): Promise<void> {
+			const folder = join(root, relative);
+			await fsPromises.mkdir(folder, { recursive: true });
+			if (options?.repository) {
+				await initRepository(folder);
+			}
+			if (options?.gitFile) {
+				// A worktree's or submodule's `.git` is a file pointing at its Git directory
+				await initRepository(folder, `--separate-git-dir=${join(gitDirs, relative.replace(/[\\/.]/g, '_') || 'root')}`);
+			}
+		}
+
+		async function find(limit = 16, folder = root): Promise<string[]> {
+			const git = store.add(new AgentHostGitService(...gitArguments()));
+			return (await git.findRepositories(URI.file(folder), limit)).map(repository => relative(root, repository.fsPath).split(sep).join('/'));
+		}
+
+		test('finds the repositories in the immediate subfolders, in name order, up to the limit', async () => {
+			await makeFolder('lib', { repository: true });
+			await makeFolder('app', { gitFile: true });
+			// Not looked into: deeper folders, and the inside of a found repository
+			await makeFolder('group/deep', { repository: true });
+			await makeFolder('app/nested', { repository: true });
+			await makeFolder('notes');
+
+			assert.deepStrictEqual({ found: await find(), capped: await find(1), none: await find(0) }, {
+				found: ['app', 'lib'],
+				capped: ['app'],
+				none: [],
+			});
+		});
+
+		test('takes a subfolder with a .git entry only when Git opens a checkout rooted there, and follows no symbolic link', async () => {
+			// An empty `.git` folder and a broken `.git` file, which Git does not open
+			await fsPromises.mkdir(join(root, 'empty/.git'), { recursive: true });
+			await fsPromises.mkdir(join(root, 'broken'), { recursive: true });
+			await fsPromises.writeFile(join(root, 'broken/.git'), 'gitdir: ../missing');
+			await makeFolder('valid', { repository: true });
+			await fsPromises.mkdir(gitDirs + '/linked-repository', { recursive: true });
+			await initRepository(join(gitDirs, 'linked-repository'));
+			await fsPromises.symlink(join(gitDirs, 'linked-repository'), join(root, 'link'), 'dir');
+
+			assert.deepStrictEqual(await find(), ['valid']);
+		});
+
+		test('finds nothing in a folder it cannot read', async () => {
+			assert.deepStrictEqual(await find(16, join(root, 'missing')), []);
+		});
+	});
+
 	suite('getRepositoryRoot', () => {
 		// An existing directory, so lookups reach the stubbed git probe.
 		const directory = URI.file(tmpdir());
@@ -355,6 +426,42 @@ suite('AgentHostGitService', () => {
 				}
 			}(...gitArguments()));
 		}
+
+		test('a fresh lookup of a folder whose .git was removed drops the root cached while it was a repository', async () => {
+			const folder = await fsPromises.mkdtemp(join(tmpdir(), 'agent-host-fresh-git-removed-'));
+			try {
+				await new Promise<void>((resolve, reject) => execFile('git', ['init', '-q', folder], error => error ? reject(error) : resolve()));
+				const git = store.add(new AgentHostGitService(...gitArguments()));
+				const warmed = await git.getRepositoryRoot(URI.file(folder));
+				await fsPromises.rm(join(folder, '.git'), { recursive: true, force: true });
+				const cached = await git.getRepositoryRoot(URI.file(folder));
+				const fresh = await git.getRepositoryRoot(URI.file(folder), { fresh: true });
+
+				assert.deepStrictEqual({ warmed: !!warmed, cached: !!cached, fresh, hasGitRoot: git.hasGitRoot(URI.file(folder)).get() }, {
+					warmed: true, cached: true, fresh: undefined, hasGitRoot: false,
+				});
+			} finally {
+				await fsPromises.rm(folder, { recursive: true, force: true });
+			}
+		});
+
+		test('a fresh lookup reads the disk whatever is cached, and a folder gone from it replaces its cached root', async () => {
+			const folder = await fsPromises.mkdtemp(join(tmpdir(), 'agent-host-fresh-root-'));
+			let probes = 0;
+			const git = createGitService(async () => { probes++; return folder; });
+			const warmed = await git.getRepositoryRoot(URI.file(folder));
+			await fsPromises.rm(folder, { recursive: true, force: true });
+
+			const cached = await git.getRepositoryRoot(URI.file(folder));
+			const fresh = await git.getRepositoryRoot(URI.file(folder), { fresh: true });
+			const afterFresh = await git.getRepositoryRoot(URI.file(folder));
+
+			// As the URI writes the folder's path, a Windows drive letter in lower case
+			const expected = URI.file(folder).fsPath;
+			assert.deepStrictEqual({ warmed: warmed?.fsPath, cached: cached?.fsPath, fresh, afterFresh, probes }, {
+				warmed: expected, cached: expected, fresh: undefined, afterFresh: undefined, probes: 1,
+			});
+		});
 
 		test('concurrent forced lookups share a failed probe without caching an I/O failure', async () => {
 			const started = new DeferredPromise<void>();
@@ -391,26 +498,6 @@ suite('AgentHostGitService', () => {
 			assert.deepStrictEqual({ before, after: after?.fsPath, probes }, {
 				before: [undefined, undefined], after: directory.fsPath, probes: 2,
 			});
-		});
-	});
-
-	test('maps branches and GitHub pull request refs to origin tracking refs', () => {
-		assert.deepStrictEqual({
-			branch: getRemoteTrackingRef('feature'),
-			pullRequest: getRemoteTrackingRef('refs/pull/42/head'),
-		}, {
-			branch: {
-				branchName: 'feature',
-				remoteBranch: 'origin/feature',
-				remoteRef: 'refs/remotes/origin/feature',
-				sourceRef: 'refs/heads/feature',
-			},
-			pullRequest: {
-				branchName: 'pull/42/head',
-				remoteBranch: 'origin/pull/42/head',
-				remoteRef: 'refs/remotes/origin/pull/42/head',
-				sourceRef: 'refs/pull/42/head',
-			},
 		});
 	});
 
@@ -911,6 +998,14 @@ suite('AgentHostGitService', () => {
 			);
 		});
 
+		test('names the subcommand after leading -c options', () => {
+			const err = Object.assign(new Error('Command failed'), { code: 128 });
+			assert.strictEqual(
+				formatGitError(['-c', 'checkout.workers=0', 'worktree', 'add', '/tmp/y', 'main'], 30_000, false, err, 'fatal: invalid reference: main\n'),
+				'git worktree exited with code 128: fatal: invalid reference: main',
+			);
+		});
+
 		test('falls back to error message when there is no signal or exit code', () => {
 			const err = new Error('spawn git ENOENT');
 			assert.strictEqual(
@@ -978,21 +1073,44 @@ suite('AgentHostGitService', () => {
 		});
 	});
 
-	suite('resolveDiffBaseBranchName', () => {
-		test('prefers the persisted base branch, then git state, then undefined', () => {
-			assert.deepStrictEqual(
-				[
-					resolveDiffBaseBranchName('persisted', 'gitState'),
-					resolveDiffBaseBranchName(undefined, 'gitState'),
-					resolveDiffBaseBranchName('persisted', undefined),
-					resolveDiffBaseBranchName('origin/main', undefined),
-					resolveDiffBaseBranchName('refs/remotes/origin/release', undefined),
-					resolveDiffBaseBranchName(undefined, undefined),
-					resolveDiffBaseBranchName('', 'origin/main'),
-					resolveDiffBaseBranchName('', undefined),
+	test('getWorktreeAddFailureMessage explains well-known git worktree add failures', () => {
+		const gitLfsMissing = 'The repository uses Git LFS, but Git LFS isn\'t installed or can\'t be found on the PATH.';
+		assert.deepStrictEqual([
+			'Preparing worktree (new branch \'agents/a\')\nerror: unable to create file src/a: Filename too long\nfatal: Could not reset index file to revision \'HEAD\'.\n',
+			'Preparing worktree (new branch \'agents/a\')\ngit-lfs filter-process: git-lfs: command not found\nfatal: the remote end hung up unexpectedly\n',
+			'Preparing worktree (new branch \'agents/a\')\n/bin/sh: 1: git-lfs: not found\nfatal: the remote end hung up unexpectedly\n',
+			'Preparing worktree (new branch \'agents/a\')\nHEAD is now at 14e5e32 lfs\n\nThis repository is configured for Git LFS but \'git-lfs\' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the \'post-checkout\' file in the hooks directory (set by \'core.hookspath\'; usually \'.git/hooks\').\n\n',
+			'Preparing worktree (new branch \'agents/a\')\nfatal: cannot lock ref \'refs/heads/agents/a\': Unable to create \'/repo/.git/refs/heads/agents/a.lock\': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n',
+			'Preparing worktree (new branch \'agents/a\')\nerror: unable to write file \'big.bin\'\nfatal: Could not reset index file to revision \'HEAD\'.\n',
+		].map(getWorktreeAddFailureMessage), [
+			isWindows
+				? 'A file path in the worktree is too long for Windows. If the full path is longer than 260 characters, run `git config --global core.longpaths true` to allow long paths in Git. If a file or folder name is longer than 255 characters, shorten it in the repository.'
+				: 'A file path in the worktree is too long for the file system.',
+			gitLfsMissing,
+			gitLfsMissing,
+			gitLfsMissing,
+			'Another Git process is using the repository. If no Git process is running, delete the lock file \'/repo/.git/refs/heads/agents/a.lock\'.',
+			undefined,
+		]);
+	});
+
+	suite('base branch refs', () => {
+		test('parses local and remote refs at the longest remote name, and labels them without the ref prefix', () => {
+			const refs = ['refs/heads/main', 'refs/heads/lszomoru/agents/foo', 'refs/remotes/origin/main', 'refs/remotes/fork/me/release/1.90', 'refs/remotes/gone/main', 'refs/tags/v1'];
+			assert.deepStrictEqual({
+				parsed: refs.map(ref => parseBaseBranchRef(ref, ['origin', 'fork/me'])),
+				labels: ['refs/heads/main', 'refs/remotes/fork/me/release/1.90', 'origin/main'].map(getBaseBranchLabel),
+			}, {
+				parsed: [
+					{ kind: 'local', ref: 'refs/heads/main', branch: 'main' },
+					{ kind: 'local', ref: 'refs/heads/lszomoru/agents/foo', branch: 'lszomoru/agents/foo' },
+					{ kind: 'remote', ref: 'refs/remotes/origin/main', remote: 'origin', branch: 'main' },
+					{ kind: 'remote', ref: 'refs/remotes/fork/me/release/1.90', remote: 'fork/me', branch: 'release/1.90' },
+					undefined,
+					undefined,
 				],
-				['persisted', 'gitState', 'persisted', 'main', 'release', undefined, 'main', undefined],
-			);
+				labels: ['main', 'fork/me/release/1.90', 'origin/main'],
+			});
 		});
 	});
 

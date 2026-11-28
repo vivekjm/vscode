@@ -10,6 +10,8 @@ import { Emitter, Event } from '../../../../../../../base/common/event.js';
 import { isCancellationError } from '../../../../../../../base/common/errors.js';
 import { constObservable, derived, ISettableObservable, observableValue } from '../../../../../../../base/common/observable.js';
 import { isWindows, OperatingSystem } from '../../../../../../../base/common/platform.js';
+import { basename } from '../../../../../../../base/common/resources.js';
+import { URI } from '../../../../../../../base/common/uri.js';
 import { mock, upcastPartial } from '../../../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../../base/test/common/utils.js';
 import { runWithFakedTimers } from '../../../../../../../base/test/common/virtualScheduling/index.js';
@@ -46,7 +48,7 @@ import { TestProgressService } from '../../../../../../test/browser/workbenchTes
 import { IInputOptions, IQuickInputService, IQuickPickItem, QuickPickInput } from '../../../../../../../platform/quickinput/common/quickInput.js';
 import { InMemoryStorageService, IStorageService, StorageScope, StorageTarget } from '../../../../../../../platform/storage/common/storage.js';
 import { IAgentHostSessionsProvider, LocalAgentHostRegistration } from '../../../../common/agentHostSessionsProvider.js';
-import { DevContainerAgentHostEnabledSettingId, DevContainerEnvironmentsEnabledSettingId, IDevContainerAgentHostService, IDevContainerEnvironment, LocalDevContainerEnvironmentHost } from '../../../../common/devContainerAgentHostService.js';
+import { DevContainerAgentHostEnabledSettingId, DevContainerDiscoveryEnabledSettingId, DevContainerEnvironmentsEnabledSettingId, IDevContainerAgentHostService, IDevContainerEnvironment, IDevContainerFolderContainer, LocalDevContainerEnvironmentHost } from '../../../../common/devContainerAgentHostService.js';
 import { ITelemetryService } from '../../../../../../../platform/telemetry/common/telemetry.js';
 import { TestExperimentTriggerTelemetryService } from '../../../../../../../platform/telemetry/test/common/experimentTriggerTestUtils.js';
 import { ISessionsProvidersService } from '../../../../browser/sessionsProvidersService.js';
@@ -159,7 +161,7 @@ suite('RemotesModel', () => {
 			getPreference: key => locationPreferences.get(key),
 			setPreference: (key, preference) => { locationPreferences.set(key, preference); },
 		});
-		instantiationService.stub(IProductService, { nameShort: 'Code - OSS', nameLong: 'Code - OSS', version: '1.140.0', commit: 'client-commit', quality: 'insider', date: '2026-11-20T00:00:00.000Z' });
+		instantiationService.stub(IProductService, { nameShort: 'Code - OSS', nameLong: 'Code - OSS', version: '1.140.0', commit: 'client-commit', quality: 'insider', date: '2026-11-20T00:00:00.000Z', serverDataFolderName: '.vscode-server-insiders' });
 		instantiationService.stub(IProgressService, new TestProgressService());
 		instantiationService.stub(IRemoteTunnelService, {
 			onDidChangeTunnelStatus: tunnelStatusChanged.event,
@@ -398,11 +400,16 @@ suite('RemotesModel', () => {
 		const devContainers = {
 			environments: observableValue<readonly IDevContainerEnvironment[]>(store, []),
 			hosts: observableValue<ReadonlySet<string>>(store, new Set()),
+			folders: observableValue<readonly IDevContainerFolderContainer[]>(store, []),
+			folderRefreshes: 0,
 			deletions: [] as string[],
 		};
 		instantiationService.stub(IDevContainerAgentHostService, {
 			environments: devContainers.environments,
 			environmentHosts: devContainers.hosts,
+			folderContainers: devContainers.folders,
+			refreshFolderContainers: async () => { devContainers.folderRefreshes++; },
+			getWorkspaceLabel: workspaceUri => `${basename(workspaceUri)} [Dev Container]`,
 			createEnvironment: async sourceAddress => {
 				const environment = { address: `devcontainer:${sourceAddress}`, sourceAddress, providerId: `agenthost-devcontainer:${sourceAddress}` };
 				devContainers.environments.set([...devContainers.environments.get(), environment], undefined);
@@ -742,6 +749,32 @@ suite('RemotesModel', () => {
 		});
 	});
 
+	test('lists folder Dev Containers with their running state, named like their sessions, and lists them again on refresh', async () => {
+		const { model, devContainers, setConfiguration } = setup();
+		await setConfiguration(DevContainerAgentHostEnabledSettingId, true);
+		const folder = (path: string, running: boolean | undefined, sourceAddress = LocalDevContainerEnvironmentHost): IDevContainerFolderContainer => ({
+			address: `devcontainer:${path}`, providerId: `agenthost-devcontainer-${path}`, workspaceUri: URI.file(`/${path}`), sourceAddress, running,
+		});
+		devContainers.folders.set([folder('running', true), folder('stopped', false), folder('unknown', undefined, 'ssh:build')], undefined);
+		await model.refresh(CancellationToken.None);
+		const refreshesWhileDisabled = devContainers.folderRefreshes;
+		await setConfiguration(DevContainerDiscoveryEnabledSettingId, true);
+		await model.refresh(CancellationToken.None);
+		assert.deepStrictEqual({
+			refreshesWhileDisabled,
+			refreshes: devContainers.folderRefreshes,
+			rows: model.remotes.get().filter(remote => remote.kind === 'devContainer').map(({ id, name, availability, startsOnConnect, canDelete, canRemove, devContainerFolder }) => ({ id, name, availability, startsOnConnect, canDelete, canRemove, folder: devContainerFolder?.workspaceUri.path })),
+		}, {
+			refreshesWhileDisabled: 0,
+			refreshes: 1,
+			rows: [
+				{ id: 'devcontainer:running', name: 'running [Dev Container]', availability: 'online', startsOnConnect: undefined, canDelete: undefined, canRemove: false, folder: '/running' },
+				{ id: 'devcontainer:stopped', name: 'stopped [Dev Container]', availability: 'offline', startsOnConnect: true, canDelete: undefined, canRemove: false, folder: '/stopped' },
+				{ id: 'devcontainer:unknown', name: 'unknown [Dev Container]', availability: 'unknown', startsOnConnect: undefined, canDelete: undefined, canRemove: false, folder: '/unknown' },
+			],
+		});
+	});
+
 	test('offers creating a Dev Container when only this computer has Docker, triggering the experiment in every arm', async () => {
 		const results = [];
 		for (const enabled of [false, true]) {
@@ -779,7 +812,7 @@ suite('RemotesModel', () => {
 				{ id: 'devcontainer:local', description: 'This Computer', connectsWithHost: undefined },
 				{ id: 'devcontainer:wsl:Ubuntu', description: 'Ubuntu', connectsWithHost: true },
 			],
-			details: ['This removes the container and its Docker volume from this computer, including all files in the container. Sessions that ran in it can no longer continue.'],
+			details: ['This removes the container and its Docker volume from this computer, including all files in the container. Sessions that ran in it are removed too.'],
 			deletions: ['devcontainer:local'],
 		});
 	});
@@ -802,7 +835,7 @@ suite('RemotesModel', () => {
 		assert.deepStrictEqual({ saved, forgottenHosts, remainingTrust: [...trustedHostKeys.keys()], confirmations: confirmations.map(({ message, detail }) => ({ message, detail })), forgotten, forgetAgain, connectionChanges }, {
 			saved: {
 				lastStep: { phase: 'transport.connect', outcome: 'failed', timestamp: 2, error: 'Error: Host key verification failed' },
-				ssh: { alias: 'removed', hostName: 'build.example', user: 'developer', port: 22, hasSavedHostKey: true },
+				ssh: { alias: 'removed', hostName: 'build.example', user: 'developer', port: 22, remoteLog: '.vscode-server-insiders/cli/agent-host-insider.log', hasSavedHostKey: true },
 				versions: { client: { name: 'Code - OSS', version: '1.140.0', build: { commit: 'client-commit', quality: 'insider', date: '2026-11-20T00:00:00.000Z' } } },
 			},
 			forgottenHosts: ['build.example:22'],
@@ -829,7 +862,7 @@ suite('RemotesModel', () => {
 		trustedHostKeys.set('direct-key:2222', [{ keyType: 'ssh-ed25519', fingerprint: 'SHA256:alias', addedAt: 0 }]);
 		await model.forgetSSHHostKey('ssh:dev@direct.example:2222');
 		assert.deepStrictEqual({ ssh: legacy.ssh, resolvedSSHHosts, forgottenHosts, remainingTrust: [...trustedHostKeys.keys()] }, {
-			ssh: { host: 'direct.example', hostName: 'direct.internal', user: 'dev', port: 2222, hasSavedHostKey: true },
+			ssh: { host: 'direct.example', hostName: 'direct.internal', user: 'dev', port: 2222, remoteLog: '.vscode-server-insiders/cli/agent-host-insider.log', hasSavedHostKey: true },
 			resolvedSSHHosts: ['direct.example', 'direct.example'],
 			forgottenHosts: ['direct-key:2222'],
 			remainingTrust: ['direct.internal:2222'],

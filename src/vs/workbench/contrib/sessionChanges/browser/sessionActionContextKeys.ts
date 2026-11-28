@@ -3,12 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
 import { Event } from '../../../../base/common/event.js';
 import { autorun, IObservable, observableFromEvent, observableValue, transaction } from '../../../../base/common/observable.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
-import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { BrandedService, IConstructorSignature, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { bindContextKey, observableConfigValue } from '../../../../platform/observable/common/platformObservableUtils.js';
 import { AGENT_HOST_PULL_REQUEST_OPERATION_IDS } from '../../../../platform/agentHost/common/agentHostChangesetOperationService.js';
@@ -25,19 +25,22 @@ export interface ISessionActionContextKeysSource {
 	readonly session: IObservable<ISession | undefined>;
 	/** The chat the host shows of {@link session}. */
 	readonly chat: IObservable<IChat | undefined>;
-	readonly changes: Pick<IChangesSessionObservables, 'changesObs' | 'changesetsLoadingObs' | 'loadingObs' | 'changesetObs' | 'changesetOperationsObs' | 'stateObs'>;
+	readonly changes: Pick<IChangesSessionObservables, 'changesObs' | 'changesetsLoadingObs' | 'loadingObs' | 'changesetObs' | 'changesetOperationsObs' | 'stateObs' | 'operationsChangesetObs' | 'repositoryObs'>;
 	readonly pullRequest: Pick<IGitHubSessionPullRequestObservables, 'pullRequestCIObs'>;
 }
 
 /**
  * Binds additional session action context keys, e.g. contributed by providers
- * which shared Sessions code must not import.
+ * which shared Sessions code must not import. A binder is created with the
+ * source and context key service it binds, followed by the services it injects,
+ * and unbinds when disposed.
  */
-export type SessionActionContextKeyBinder = (accessor: ServicesAccessor, source: ISessionActionContextKeysSource, contextKeyService: IContextKeyService) => IDisposable;
+export type SessionActionContextKeyBinder = IConstructorSignature<IDisposable, [source: ISessionActionContextKeysSource, contextKeyService: IContextKeyService]>;
 
 const sessionActionContextKeyBinders: SessionActionContextKeyBinder[] = [];
 
-export function registerSessionActionContextKeyBinder(binder: SessionActionContextKeyBinder): IDisposable {
+export function registerSessionActionContextKeyBinder<Services extends BrandedService[]>(ctor: { new(source: ISessionActionContextKeysSource, contextKeyService: IContextKeyService, ...services: Services): IDisposable }): IDisposable {
+	const binder = ctor as SessionActionContextKeyBinder;
 	sessionActionContextKeyBinders.push(binder);
 	return {
 		dispose: () => {
@@ -56,14 +59,26 @@ export function registerSessionActionContextKeyBinder(binder: SessionActionConte
  * on their own scoped context key service, so every window sees its session.
  */
 export function bindSessionActionContextKeys(instantiationService: IInstantiationService, source: ISessionActionContextKeysSource, contextKeyService: IContextKeyService): IDisposable {
-	const store = new DisposableStore();
-	store.add(instantiationService.invokeFunction(accessor => bindChangesetOperationContextKeys(source, contextKeyService, accessor.get(ILogService))));
-	store.add(instantiationService.invokeFunction(accessor => bindArtifactIntegrationsContextKey(source, contextKeyService, accessor.get(IConfigurationService))));
-	store.add(bindSessionCIChecksContextKeys(source.pullRequest, contextKeyService));
-	for (const binder of sessionActionContextKeyBinders) {
-		store.add(instantiationService.invokeFunction(accessor => binder(accessor, source, contextKeyService)));
+	return instantiationService.createInstance(SessionActionContextKeys, source, { contextKeyService });
+}
+
+/** The session action context keys of {@link bindSessionActionContextKeys}, bound until disposed. */
+class SessionActionContextKeys extends Disposable {
+	constructor(
+		source: ISessionActionContextKeysSource,
+		{ contextKeyService }: { readonly contextKeyService: IContextKeyService },
+		@ILogService logService: ILogService,
+		@IConfigurationService configurationService: IConfigurationService,
+		@IInstantiationService instantiationService: IInstantiationService,
+	) {
+		super();
+		this._register(bindChangesetOperationContextKeys(source, contextKeyService, logService));
+		this._register(bindArtifactIntegrationsContextKey(source, contextKeyService, configurationService));
+		this._register(bindSessionCIChecksContextKeys(source.pullRequest, contextKeyService));
+		for (const binder of sessionActionContextKeyBinders) {
+			this._register(instantiationService.createInstance(binder, source, contextKeyService));
+		}
 	}
-	return store;
 }
 
 function bindArtifactIntegrationsContextKey(source: ISessionActionContextKeysSource, contextKeyService: IContextKeyService, configurationService: IConfigurationService): IDisposable {
@@ -114,7 +129,10 @@ function bindChangesetOperationContextKeys(source: ISessionActionContextKeysSour
 			|| changes.loadingObs.read(reader)) {
 			return;
 		}
-		const operations = changes.changesetObs.read(reader)?.operations.read(reader) ?? [];
+		// The picked repository's own pull request, when one is picked; one without a changeset of its own, as for a
+		// changeset other than Branch, offers none of the chat's
+		const changeset = changes.operationsChangesetObs.read(reader);
+		const operations = changes.repositoryObs.read(reader) && changeset === changes.changesetObs.read(reader) ? [] : changeset?.operations.read(reader) ?? [];
 		const primary = operations.find(op => AGENT_HOST_PULL_REQUEST_OPERATION_IDS.has(op.id))?.id ?? '';
 		const hasOpenPullRequest = changes.stateObs.read(reader)?.hasOpenPullRequest === true;
 		contextKeyService.bufferChangeEvents(() => {

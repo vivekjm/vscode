@@ -34,6 +34,7 @@ import { toAgentMessageDelegationMeta } from '../../common/meta/agentMessageDele
 import { withEphemeralSessionMeta } from '../../common/meta/agentEphemeralSessionMeta.js';
 import { IAgentHostChatRowStore, IAgentHostSessionStateStore, SessionStateMirrorFlush } from '../../common/agentHostSessionStateStore.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
+import { pathRule, permissionGrantOptionId, PermissionGrantScope } from '../../common/permissionRules.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { RootConfigChangedAction } from '../../common/state/protocol/actions.js';
 import { chatToolCallComplete, chatToolCallReady, chatToolCallStart, chatTurnComplete, chatTurnStarted } from '../common/chatActionBuilders.js';
@@ -83,6 +84,7 @@ import { IAgentHostArchivedChatWorkspaceService } from '../../node/chatContribut
 import { AgentHostTelemetryReporter, IAgentHostTelemetryReporter, type IAgentHostAskQuestionsToolInvokedEvent, type IAgentHostTurnCompletedEvent } from '../../node/agentHostTelemetryReporter.js';
 import { IAgentHostSessionPromptService } from '../../node/agentHostSessionPromptService.js';
 import { AgentHostToolCallTracker, IAgentHostToolCallTracker } from '../../node/agentHostToolCallTracker.js';
+import { FolderIsolationService, IFolderIsolationService, type IFolderIsolationHost } from '../../node/chatContributions/folderIsolation/folderIsolation.js';
 import { AgentHostTurnTracker, IAgentHostTurnTracker } from '../../node/agentHostTurnTracker.js';
 import { AgentHostTurnService, IAgentHostTurnService } from '../../node/agentHostTurnService.js';
 import { AgentHostLocalCommands, IAgentHostLocalCommands } from '../../node/localCommands/localChatCommand.js';
@@ -163,13 +165,13 @@ class NoopGitStateService implements IAgentHostGitStateService {
 	readonly onDidRefreshSessionGitState = Event.None;
 	readonly onDidChangeSessionGitHubState = Event.None;
 
-	async refreshSessionGitState(_sessionKey: string, _workingDirectory?: URI): Promise<void> { }
+	async refreshSessionGitState(_sessionKey: string): Promise<void> { }
 	getMaterializedWorktreeMeta(_sessionKey: string, _branchName: string): undefined { return undefined; }
 	async setFolderGitState(): Promise<void> { }
-	async resolveSessionBaseBranchName(_sessionKey: string): Promise<string | undefined> { return undefined; }
+	async resolveSessionBaseBranchRef(_sessionKey: string): Promise<string | undefined> { return undefined; }
 	async setSessionGitHubState(_sessionKey: string, _state: ISessionGitHubState): Promise<void> { }
 	async recordSessionMerge(_sessionKey: string, _commit: string): Promise<void> { }
-	async attachSessionGitHubPullRequest(_sessionKey: string, _workingDirectory?: URI): Promise<void> { }
+	async attachSessionGitHubPullRequest(_sessionKey: string): Promise<void> { }
 }
 
 class NoopWorktreeIsolation extends NullAgentHostWorktreeIsolation { }
@@ -256,6 +258,9 @@ function createTestSideEffects(
 		worktreeIsolation?: IAgentHostWorktreeIsolation;
 		fileService?: IFileService;
 		onDidCreateTurnService?: (turnService: IAgentHostTurnService) => void;
+		/** Moves folders for a real {@link FolderIsolationService}, instead of a service that moves none. */
+		folderIsolationHost?: IFolderIsolationHost;
+		onDidCreateFolderIsolation?: (service: IFolderIsolationService) => void;
 		authenticationService?: IAgentHostAuthenticationService;
 		logService?: ILogService;
 	},
@@ -275,6 +280,7 @@ function createTestSideEffects(
 	const services = new ServiceCollection(
 		[IAgentHostAuthenticationService, authenticationService],
 		[ILogService, logService],
+		[IFolderIsolationService, { _serviceBrand: undefined, request: () => { }, onTurnEnd: () => { }, isMoving: () => false, isRequested: () => false } satisfies IFolderIsolationService],
 		[IAgentConfigurationService, configService],
 		[IAgentHostChangesetService, changesets],
 		[IAgentHostCheckpointService, checkpointService],
@@ -341,6 +347,11 @@ function createTestSideEffects(
 	const turnTracker = disposables.add(instantiationService.createInstance(AgentHostTurnTracker));
 	services.set(IAgentHostTurnTracker, turnTracker);
 	services.set(IAgentHostToolCallTracker, disposables.add(instantiationService.createInstance(AgentHostToolCallTracker)));
+	if (options.folderIsolationHost) {
+		const folderIsolation = disposables.add(instantiationService.createInstance(FolderIsolationService, options.folderIsolationHost));
+		services.set(IFolderIsolationService, folderIsolation);
+		options.onDidCreateFolderIsolation?.(folderIsolation);
+	}
 	const localTurns = options.localTurns ?? new AgentHostLocalTurns(createTestChatRows(options.sessionDataService, disposables), logService);
 	services.set(IAgentHostLocalTurns, localTurns);
 	const localCommands = disposables.add(instantiationService.createInstance(AgentHostLocalCommands));
@@ -5366,6 +5377,52 @@ suite('AgentSideEffects', () => {
 			});
 		});
 
+		test('a queued message of a chat whose folder isolate_session moves waits until the folder moved, and then launches instead of the continuation', async () => {
+			const moved = new DeferredPromise<URI>();
+			let folderIsolation: IFolderIsolationService | undefined;
+			sideEffects = createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: createNullSessionDataService(),
+				hostLaunchKind: AgentHostLaunchKind.VSCodeMainProcess,
+				authenticationService,
+				folderIsolationHost: { validateFolderIsolation: () => { }, isolateChatFolder: () => moved.p },
+				onDidCreateFolderIsolation: service => folderIsolation = service,
+			}, undefined, disposables.add(new AgentHostTelemetryService(telemetryService)));
+			setupSession();
+			disposables.add(sideEffects.registerProgressListener(agent));
+			startTurn('turn-1');
+			folderIsolation!.request(sessionUri, URI.parse(defaultChatUri), 'turn-1', [URI.file('/work/lib')], undefined);
+			const setAction = {
+				type: ActionType.ChatPendingMessageSet as const,
+				kind: PendingMessageKind.Queued,
+				id: 'q-moving',
+				message: { text: 'after the move', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, setAction, { clientId: 'test', clientSeq: 1 });
+			sideEffects.handleAction(defaultChatUri, setAction);
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: chatTurnComplete('turn-1', 1000),
+			});
+			await timeout(0);
+			const whileMoving = {
+				sent: agent.sendMessageCalls.length,
+				queue: stateManager.getChatState(defaultChatUri)?.queuedMessages?.map(message => message.id),
+				moving: folderIsolation!.isMoving(defaultChatUri),
+			};
+			moved.complete(URI.file('/work/lib.worktrees/task'));
+			await waitForSendMessageCalls(1);
+
+			assert.deepStrictEqual({ whileMoving, sent: agent.sendMessageCalls.map(call => call.prompt), moving: folderIsolation!.isMoving(defaultChatUri) }, {
+				whileMoving: { sent: 0, queue: ['q-moving'], moving: true },
+				// The queued message launches once the folder moved, in place of the continuation
+				sent: ['after the move'],
+				moving: false,
+			});
+		});
+
 		test('waits for pending steering before consuming a queued message', async () => {
 			setupSession();
 			disposables.add(sideEffects.registerProgressListener(agent));
@@ -6371,6 +6428,74 @@ suite('AgentSideEffects', () => {
 				pendingConfirmations: 0,
 			});
 		});
+
+		for (const scope of [PermissionGrantScope.Session, PermissionGrantScope.Host]) {
+			test(`a saved ${scope} grant satisfies later Assisted confirmation requirements for the same read`, async () => {
+				setupSession(URI.file(resolve('/workspace')).toString());
+				stateManager.setSessionConfig(sessionUri.toString(), { schema: { type: 'object', properties: {} }, values: {} });
+				startTurn('turn-1');
+				disposables.add(sideEffects.registerProgressListener(agent));
+				const responses: { requestId: string; approved: boolean; source: string | undefined }[] = [];
+				agent.respondToPermissionRequest = (requestId, approved, context) => { responses.push({ requestId, approved, source: context?.decisionSource }); };
+				const granted = URI.file(resolve('/outside/notes.md')).fsPath;
+				const requestRead = (toolCallId: string, permissionPath: string, unattended = false) => {
+					agent.fireProgress({ kind: 'action', resource: URI.parse(defaultChatUri), action: chatToolCallStart('turn-1', toolCallId, 'read', 'Read') });
+					agent.fireProgress({
+						kind: 'pending_confirmation', chat: URI.parse(defaultChatUri), requiresUserConfirmation: true, ...(unattended ? { unattended } : {}),
+						state: { status: ToolCallStatus.PendingConfirmation, toolCallId, toolName: 'read', displayName: 'Read', invocationMessage: 'Read file', confirmationTitle: 'Read file?' },
+						permissionKind: AgentPermissionKind.Read, permissionPath,
+					});
+				};
+				const toolCalls = () => stateManager.getSessionState(defaultChatUri)?.activeTurn?.responseParts
+					.flatMap(part => part.kind === ResponsePartKind.ToolCall ? [part.toolCall] : []) ?? [];
+				const waitForStatuses = (count: number) => waitForState(stateManager, () => {
+					const settled = toolCalls().filter(toolCall => toolCall.status !== ToolCallStatus.Streaming);
+					return settled.length === count ? settled.map(toolCall => toolCall.status) : undefined;
+				});
+
+				requestRead('tc-first', granted);
+				requestRead('tc-concurrent', granted);
+				const beforeGrant = await waitForStatuses(2);
+				const optionId = permissionGrantOptionId(scope, [pathRule('Read', granted, false)!]);
+				const first = toolCalls()[0];
+				const offered = first.status === ToolCallStatus.PendingConfirmation && first.options?.some(option => option.id === optionId);
+				const confirmation: ChatAction = {
+					type: ActionType.ChatToolCallConfirmed, turnId: 'turn-1', toolCallId: 'tc-first',
+					approved: true, confirmed: ToolCallConfirmationReason.UserAction, selectedOptionId: optionId,
+				};
+				stateManager.dispatchClientAction(defaultChatUri, confirmation, { clientId: 'test', clientSeq: 2 });
+				sideEffects.handleAction(defaultChatUri, confirmation);
+				await waitForState(stateManager, () => toolCalls()[1].status === ToolCallStatus.Running || undefined);
+
+				// One at a time: each evaluation resolves paths asynchronously, so concurrent requests answer in no fixed order.
+				requestRead('tc-repeat', granted);
+				await waitForStatuses(3);
+				requestRead('tc-unattended', granted, true);
+				await waitForStatuses(4);
+				requestRead('tc-other', URI.file(resolve('/outside/other.md')).fsPath);
+				await waitForStatuses(5);
+				assert.deepStrictEqual({
+					beforeGrant, offered,
+					toolCalls: toolCalls().map(toolCall => ({ id: toolCall.toolCallId, status: toolCall.status, confirmed: toolCall.status === ToolCallStatus.Running ? toolCall.confirmed : undefined })),
+					responses,
+				}, {
+					beforeGrant: [ToolCallStatus.PendingConfirmation, ToolCallStatus.PendingConfirmation], offered: true,
+					toolCalls: [
+						{ id: 'tc-first', status: ToolCallStatus.Running, confirmed: ToolCallConfirmationReason.UserAction },
+						{ id: 'tc-concurrent', status: ToolCallStatus.Running, confirmed: ToolCallConfirmationReason.Setting },
+						{ id: 'tc-repeat', status: ToolCallStatus.Running, confirmed: ToolCallConfirmationReason.NotNeeded },
+						{ id: 'tc-unattended', status: ToolCallStatus.Running, confirmed: ToolCallConfirmationReason.NotNeeded },
+						{ id: 'tc-other', status: ToolCallStatus.PendingConfirmation, confirmed: undefined },
+					],
+					responses: [
+						{ requestId: 'tc-first', approved: true, source: undefined },
+						{ requestId: 'tc-concurrent', approved: true, source: 'host_policy' },
+						{ requestId: 'tc-repeat', approved: true, source: 'host_policy' },
+						{ requestId: 'tc-unattended', approved: true, source: 'host_policy' },
+					],
+				});
+			});
+		}
 
 		for (const autoApproved of [false, true]) {
 			test(`unattended permission requests are never shown as confirmations (autoApproved=${autoApproved})`, async () => {
@@ -9367,6 +9492,32 @@ suite('AgentSideEffects', () => {
 
 	suite('session permissions', () => {
 
+		function getToolCall(toolCallId: string) {
+			const part = stateManager.getChatState(defaultChatUri)?.activeTurn?.responseParts.find(part =>
+				part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === toolCallId
+			);
+			return part?.kind === ResponsePartKind.ToolCall ? part.toolCall : undefined;
+		}
+
+		async function startPendingCustomTool(toolCallId: string, options: { readonly managedApprovalRequired?: boolean; readonly clientTool?: boolean } = {}): Promise<void> {
+			const chat = URI.parse(defaultChatUri);
+			const contributor = options.clientTool ? { kind: ToolCallContributorKind.Client, clientId: 'test-client' } as const : undefined;
+			agent.fireProgress({
+				kind: 'action', resource: chat,
+				action: chatToolCallStart('turn-1', toolCallId, 'CustomTool', 'Custom Tool', contributor ? { contributor } : undefined),
+			});
+			agent.fireProgress({
+				kind: 'pending_confirmation', chat,
+				state: {
+					status: ToolCallStatus.PendingConfirmation, toolCallId,
+					toolName: 'CustomTool', displayName: 'Custom Tool',
+					invocationMessage: 'Run custom tool', confirmationTitle: 'Run custom tool?',
+				},
+				permissionKind: AgentPermissionKind.CustomTool, managedApprovalRequired: options.managedApprovalRequired,
+			});
+			await waitForState(stateManager, () => getToolCall(toolCallId)?.status === ToolCallStatus.PendingConfirmation || undefined);
+		}
+
 		test('live sampling tool parts route their custom approval without granting ordinary tool permissions', () => {
 			setupSession();
 			startTurn('turn-1', defaultChatUri);
@@ -9448,7 +9599,7 @@ suite('AgentSideEffects', () => {
 			assert.ok(tc && tc.kind === ResponsePartKind.ToolCall, 'tool call should exist');
 			assert.strictEqual(tc.toolCall.status, ToolCallStatus.PendingConfirmation);
 			assert.ok(Array.isArray(tc.toolCall.options), 'options should be an array');
-			assert.deepStrictEqual(tc.toolCall.options!.map(o => o.id), ['allow-session', 'allow-once', 'skip']);
+			assert.deepStrictEqual(tc.toolCall.options!.map(o => o.id), ['allow-once', 'allow-session', 'skip']);
 		});
 
 		test('ChatToolCallConfirmed with allow-session adds tool to session permissions', async () => {
@@ -9536,6 +9687,94 @@ suite('AgentSideEffects', () => {
 			assert.deepStrictEqual(agent.respondToPermissionCalls, [
 				{ requestId: 'tc-perm-3', approved: true },
 			]);
+		});
+
+		test('allow-session auto-approves other pending calls for the same tool', async () => {
+			setupSession();
+			stateManager.setSessionConfig(sessionUri.toString(), {
+				schema: { type: 'object', properties: {} },
+				values: {},
+			});
+			startTurn('turn-1');
+			disposables.add(sideEffects.registerProgressListener(agent));
+			await startPendingCustomTool('tc-a');
+			await startPendingCustomTool('tc-b');
+
+			const confirmation: ChatAction = {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId: 'turn-1',
+				toolCallId: 'tc-a',
+				approved: true,
+				confirmed: ToolCallConfirmationReason.UserAction,
+				selectedOptionId: 'allow-session',
+			};
+			stateManager.dispatchClientAction(defaultChatUri, confirmation, { clientId: 'test', clientSeq: 2 });
+			sideEffects.handleAction(defaultChatUri, confirmation);
+
+			const toolCall = await waitForState(stateManager, () => {
+				const pending = getToolCall('tc-b');
+				return pending?.status === ToolCallStatus.Running ? pending : undefined;
+			});
+			assert.deepStrictEqual({
+				status: toolCall.status,
+				confirmed: toolCall.confirmed,
+				responses: agent.respondToPermissionCalls,
+			}, {
+				status: ToolCallStatus.Running,
+				confirmed: ToolCallConfirmationReason.Setting,
+				responses: [
+					{ requestId: 'tc-a', approved: true },
+					{ requestId: 'tc-b', approved: true },
+				],
+			});
+		});
+
+		test('switching to Allow All auto-approves pending calls except managed approvals and client tools', async () => {
+			setupSession();
+			stateManager.setSessionConfig(sessionUri.toString(), {
+				schema: {
+					type: 'object',
+					properties: {
+						[SessionConfigKey.AutoApprove]: {
+							type: 'string',
+							title: 'Approvals',
+							enum: ['default', 'autoApprove', 'autopilot'],
+							default: 'default',
+							sessionMutable: true,
+						},
+					},
+				},
+				values: { [SessionConfigKey.AutoApprove]: 'default' },
+			});
+			startTurn('turn-1');
+			disposables.add(sideEffects.registerProgressListener(agent));
+			await startPendingCustomTool('tc-ordinary');
+			await startPendingCustomTool('tc-managed', { managedApprovalRequired: true });
+			await startPendingCustomTool('tc-client', { clientTool: true });
+
+			stateManager.dispatchClientAction(sessionUri.toString(), {
+				type: ActionType.SessionConfigChanged,
+				config: { [SessionConfigKey.AutoApprove]: 'autoApprove' },
+			}, { clientId: 'test', clientSeq: 2 });
+
+			const toolCall = await waitForState(stateManager, () => {
+				const pending = getToolCall('tc-ordinary');
+				return pending?.status === ToolCallStatus.Running ? pending : undefined;
+			});
+			await timeout(0);
+			assert.deepStrictEqual({
+				status: toolCall.status,
+				confirmed: toolCall.confirmed,
+				managedStatus: getToolCall('tc-managed')?.status,
+				clientStatus: getToolCall('tc-client')?.status,
+				responses: agent.respondToPermissionCalls,
+			}, {
+				status: ToolCallStatus.Running,
+				confirmed: ToolCallConfirmationReason.Setting,
+				managedStatus: ToolCallStatus.PendingConfirmation,
+				clientStatus: ToolCallStatus.PendingConfirmation,
+				responses: [{ requestId: 'tc-ordinary', approved: true }],
+			});
 		});
 
 		test('managed approval bypasses global, session, and per-tool auto-approval', async () => {
