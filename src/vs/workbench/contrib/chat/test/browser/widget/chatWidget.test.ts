@@ -3492,6 +3492,26 @@ suite('ChatWidget - acceptInput submission', () => {
 		});
 	}
 
+	for (const preserveInput of [false, true]) {
+		test(`only prefills a response's next question when the input was consumed (preserveInput: ${preserveInput})`, async () => {
+			const fixture = createSubmissionWidget(undefined, 'Keep this draft');
+			const complete = new DeferredPromise<void>();
+			const question = 'Which option should I use?';
+			Object.defineProperty(fixture.original.viewModel, 'getItems', {
+				value: () => [{ setVote: () => { }, result: { nextQuestion: { prompt: question } } }],
+			});
+			fixture.chatService.sendRequest.resolves({
+				...fixture.sent,
+				data: { ...fixture.sent.data, responseCompletePromise: complete.p },
+			});
+
+			await fixture.widget.acceptInput('/act-on-feedback', { preserveInput });
+			await complete.complete();
+
+			assert.deepStrictEqual(fixture.input.setValue.getCalls().map(call => call.args), preserveInput ? [] : [[question, false]]);
+		});
+	}
+
 	test('a failed send does not report an accepted request', async () => {
 		const fixture = createSubmissionWidget();
 		fixture.chatService.sendRequest.rejects(new Error('Send failed'));

@@ -4610,7 +4610,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				const responses = this.viewModel?.getItems().filter(isResponseVM);
 				const lastResponse = responses?.[responses.length - 1];
 				this.chatAccessibilityService.acceptResponse(lastResponse, submittedSessionResource, options?.isVoiceInput);
-				if (lastResponse?.result?.nextQuestion) {
+				if (!options.preserveInput && lastResponse?.result?.nextQuestion) {
 					const { prompt, participant, command } = lastResponse.result.nextQuestion;
 					const question = formatChatQuestion(this.chatAgentService, this.location, prompt, participant, command);
 					if (question) {
